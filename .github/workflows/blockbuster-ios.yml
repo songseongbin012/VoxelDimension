@@ -15,9 +15,15 @@ permissions:
   contents: write
 jobs:
   ios:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 90
     steps:
+      # App Store Connect takes only apps built with the iOS 26 SDK or later (Xcode 26+): the newest Xcode on the runner.
+      - name: Pick the newest Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v -i beta | sort -V | tail -n 1)
+          if [ -n "$XC" ]; then sudo xcode-select -s "$XC/Contents/Developer"; fi
+          xcodebuild -version
       - name: Check the Apple secrets
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -120,6 +126,15 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             archive | tail -n 60
           test -d "$RUNNER_TEMP/App.xcarchive"
+          # The unsigned archive leaves embedded frameworks (Google Mobile Ads, UMP, Firebase…) unsigned and the
+          # export does not sign them: give them a placeholder signature, which the export replaces with the
+          # distribution one (App Store Connect refuses nested code that is not properly signed).
+          APP=$(ls -d "$RUNNER_TEMP"/App.xcarchive/Products/Applications/*.app | head -n 1)
+          if [ -d "$APP/Frameworks" ]; then
+            find "$APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' F; do
+              codesign --force --sign - --timestamp=none "$F"
+            done
+          fi
       - name: Export the IPA
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
