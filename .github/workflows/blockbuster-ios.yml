@@ -1,0 +1,156 @@
+# Made by the BlockBuster Builder (Platforms › Package Project › iOS). It is written again before every build:
+# change the Builder, not this file.
+name: BlockBuster iOS
+run-name: BlockBuster iOS ${{ inputs.request }}
+on:
+  workflow_dispatch:
+    inputs:
+      asset:
+        description: The game archive (release asset id)
+        required: true
+      request:
+        description: The Builder's build id
+        required: true
+permissions:
+  contents: write
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check the Apple secrets
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          missing=""
+          for name in APPLE_TEAM_ID ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8; do
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (Settings › Secrets and variables › Actions)."
+            exit 1
+          fi
+      - name: Download the game
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/assets/${{ inputs.asset }}" -o game.tar.gz
+          mkdir game
+          tar -xzf game.tar.gz -C game
+          rm game.tar.gz
+          du -sh game/www
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Make the Xcode project (Capacitor 8.5.3)
+        working-directory: game
+        run: |
+          npm init -y > /dev/null
+          npm install --save-exact --no-audit --no-fund @capacitor/core@8.5.3 @capacitor/cli@8.5.3 @capacitor/ios@8.5.3
+          cp bb-ios/capacitor.config.json capacitor.config.json
+          if [ -d bb-ios/plugin ]; then
+            echo "Installing the game's native plugin (ads / Game Center / Firebase)"
+            npm install --no-audit --no-fund ./bb-ios/plugin
+          fi
+          npx cap add ios --packagemanager SPM
+          npx cap sync ios
+      - name: App settings, version and icon
+        working-directory: game
+        run: |
+          cfg() { node -p "require('./bb-ios/config.json').$1"; }
+          PLIST=ios/App/App/Info.plist
+          plutil -replace CFBundleDisplayName -string "$(cfg product)" "$PLIST"
+          plutil -replace UIStatusBarHidden -bool YES "$PLIST"
+          plutil -replace UIViewControllerBasedStatusBarAppearance -bool NO "$PLIST"
+          plutil -replace UIRequiresFullScreen -bool YES "$PLIST"
+          plutil -replace ITSAppUsesNonExemptEncryption -bool NO "$PLIST"
+          ORIENT=$(node -p "JSON.stringify(require('./bb-ios/config.json').orientations)")
+          plutil -replace UISupportedInterfaceOrientations -json "$ORIENT" "$PLIST"
+          plutil -replace "UISupportedInterfaceOrientations~ipad" -json "$ORIENT" "$PLIST"
+          if [ "$(node -p "!!require('./bb-ios/config.json').ads")" = "true" ]; then
+            plutil -replace GADApplicationIdentifier -string "$(cfg ads.appId)" "$PLIST"
+            SKAD=$(node -p "JSON.stringify(require('./bb-ios/config.json').ads.skAdNetworks.map((id) => ({ SKAdNetworkIdentifier: id })))")
+            plutil -replace SKAdNetworkItems -json "$SKAD" "$PLIST"
+            TRACK=$(cfg ads.tracking)
+            if [ -n "$TRACK" ]; then plutil -replace NSUserTrackingUsageDescription -string "$TRACK" "$PLIST"; fi
+            echo "AdMob app $(cfg ads.appId)"
+          fi
+          PBX=ios/App/App.xcodeproj/project.pbxproj
+          sed -i '' -E "s/MARKETING_VERSION = [^;]*;/MARKETING_VERSION = $(cfg version);/g; s/CURRENT_PROJECT_VERSION = [^;]*;/CURRENT_PROJECT_VERSION = $(cfg build);/g" "$PBX"
+          if [ "$(cfg gameCenter)" = "true" ]; then
+            printf '%s' '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.developer.game-center</key><true/></dict></plist>' > ios/App/App/App.entitlements
+            sed -i '' -E "s|(MARKETING_VERSION = [^;]*;)|\1 CODE_SIGN_ENTITLEMENTS = App/App.entitlements;|g" "$PBX"
+            echo "Game Center: entitlement added"
+          fi
+          ICONS=ios/App/App/Assets.xcassets/AppIcon.appiconset
+          rm -f "$ICONS"/*.png
+          cp bb-ios/AppIcon.png "$ICONS/AppIcon-1024.png"
+          printf '%s' '{"images":[{"filename":"AppIcon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}' > "$ICONS/Contents.json"
+          echo "$(cfg appId) $(cfg version) ($(cfg build))"
+      - name: App Store Connect API key
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p ~/private_keys
+          KEY=~/private_keys/AuthKey_$ASC_KEY_ID.p8
+          if printf '%s' "$ASC_KEY_P8" | grep -q "BEGIN PRIVATE KEY"; then printf '%s\n' "$ASC_KEY_P8" > "$KEY"; else printf '%s' "$ASC_KEY_P8" | base64 --decode > "$KEY"; fi
+          echo "ASC_KEY_PATH=$KEY" >> "$GITHUB_ENV"
+      - name: Archive (signed with the API key)
+        working-directory: game/ios/App
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          if [ -d App.xcworkspace ]; then SOURCE="-workspace App.xcworkspace"; else SOURCE="-project App.xcodeproj"; fi
+          # Google's Mobile Ads SDK and Firebase need the -ObjC linker flag.
+          EXTRA=()
+          if [ "$(node -p "!!(require('../../bb-ios/config.json').ads || require('../../bb-ios/config.json').firebase)")" = "true" ]; then EXTRA=('OTHER_LDFLAGS=$(inherited) -ObjC'); fi
+          xcodebuild $SOURCE -scheme App -configuration Release -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic "${EXTRA[@]}" \
+            archive | tail -n 60
+          test -d "$RUNNER_TEMP/App.xcarchive"
+      - name: Export the IPA
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>destination</key><string>export</string>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          ls -la "$RUNNER_TEMP/export"
+      - name: Upload to TestFlight
+        working-directory: game
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          if [ "$(node -p "require('./bb-ios/config.json').upload")" != "true" ]; then echo "Not uploading (Project Settings › Platforms › iOS › Upload to TestFlight is off)."; exit 0; fi
+          IPA=$(ls "$RUNNER_TEMP"/export/*.ipa | head -n 1)
+          xcrun altool --upload-app -f "$IPA" -t ios --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa
+          path: ${{ runner.temp }}/export/*.ipa
+          retention-days: 3
+          if-no-files-found: error
