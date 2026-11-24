@@ -100,7 +100,9 @@ jobs:
           KEY=~/private_keys/AuthKey_$ASC_KEY_ID.p8
           if printf '%s' "$ASC_KEY_P8" | grep -q "BEGIN PRIVATE KEY"; then printf '%s\n' "$ASC_KEY_P8" > "$KEY"; else printf '%s' "$ASC_KEY_P8" | base64 --decode > "$KEY"; fi
           echo "ASC_KEY_PATH=$KEY" >> "$GITHUB_ENV"
-      - name: Archive (signed with the API key)
+      # The archive is left unsigned: signing it here would ask for a development profile, which needs a
+      # registered iPhone. The export below signs it for the App Store (no devices needed).
+      - name: Archive (signed when exported)
         working-directory: game/ios/App
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -115,6 +117,7 @@ jobs:
             -archivePath "$RUNNER_TEMP/App.xcarchive" \
             -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic "${EXTRA[@]}" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             archive | tail -n 60
           test -d "$RUNNER_TEMP/App.xcarchive"
       - name: Export the IPA
