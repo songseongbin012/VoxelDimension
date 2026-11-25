@@ -135,6 +135,14 @@ jobs:
               codesign --force --sign - --timestamp=none "$F"
             done
           fi
+          # Firebase reads GoogleService-Info.plist from the bundle's top: the game's copy is in public/.
+          if [ -f "$APP/public/GoogleService-Info.plist" ]; then cp "$APP/public/GoogleService-Info.plist" "$APP/GoogleService-Info.plist"; fi
+          # An unsigned app carries no entitlements, and the export signs with the ones it finds in the app's
+          # signature: a placeholder signature holding them (Game Center) hands them to the export.
+          if [ -f App/App.entitlements ]; then
+            codesign --force --sign - --timestamp=none --entitlements App/App.entitlements "$APP"
+            codesign -d --entitlements - "$APP" 2>/dev/null | grep -q "game-center" && echo "Entitlements placed in the archive"
+          fi
       - name: Export the IPA
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -157,6 +165,13 @@ jobs:
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
             -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
           ls -la "$RUNNER_TEMP/export"
+          # A Game Center app whose signature lacks the entitlement cannot be sent to review: stop here.
+          if [ -f game/ios/App/App/App.entitlements ]; then
+            mkdir -p "$RUNNER_TEMP/ipa" && unzip -q -o "$RUNNER_TEMP"/export/*.ipa -d "$RUNNER_TEMP/ipa"
+            SIGNED=$(ls -d "$RUNNER_TEMP"/ipa/Payload/*.app | head -n 1)
+            codesign -d --entitlements - "$SIGNED" 2>/dev/null | tee "$RUNNER_TEMP/entitlements.txt" | grep -v "^Executable" || true
+            grep -q "com.apple.developer.game-center" "$RUNNER_TEMP/entitlements.txt" || { echo "::error::The signed app has no com.apple.developer.game-center entitlement"; exit 1; }
+          fi
       - name: Upload to TestFlight
         working-directory: game
         env:
